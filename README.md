@@ -47,8 +47,8 @@ a rewrite:
 
 Everything else — EA, reparse points, named streams, SLOWIO, name normalisation,
 SDDL/security, `Control`, the SLOWIO options, the large-heap code — is untouched.
-The large-heap functions and the SLOWIO machinery are now unused/dead weight; see
-*Optional further slimming* below. The complete delta is reviewable with:
+The large-heap functions and the SLOWIO machinery are now unused/dead weight.
+The complete delta is reviewable with:
 
 ```
 python3 nullfs-from-memfs.py . .      # regenerate (will abort if memfs.* changed)
@@ -314,36 +314,3 @@ dir /b X:\
 rem the 7 newest files survive (f14.txt .. f20.txt); the root directory takes the
 rem 8th slot, and f1.txt .. f13.txt were dropped into the void
 ```
-
-## Optional further slimming
-
-If you want a smaller file rather than the minimal-diff version, comment out the
-`#define NULLFS_…` feature macros near the top of `nullfs.cpp`
-(`NULLFS_SLOWIO`, `NULLFS_EA`, `NULLFS_REPARSE_POINTS`, `NULLFS_NAMED_STREAMS`,
-`NULLFS_DIRINFO_BY_NAME`, `NULLFS_CONTROL`, `NULLFS_WSL`,
-`NULLFS_DISPATCHER_STOPPED`, `NULLFS_NAME_NORMALIZATION`) and delete the now-unused
-large-heap block. Each macro is a real compile-time toggle and the surrounding code is
-`#if`-guarded, but **I did not do this and could not compile-test those combinations**,
-so it is left as an exercise rather than presented as working. Note that dropping
-`NULLFS_SLOWIO` makes the `-M`/`-P`/`-R` options no-ops.
-
-## Provenance and licence
-
-`nullfs.cpp`, `nullfs.h` and `nullfs-main.c` are modified copies of the MEMFS sample
-that ships with WinFsp (`tst/memfs`, tag `v2.1`), which is
-**GPLv3** (with a commercial-licence alternative from the WinFsp author). The original
-copyright notice is retained and each file carries a note describing the
-modification. If you plan to redistribute this, the GPLv3 obligations apply — for
-local, internal use there is nothing to worry about. WinFsp's own driver and DLL are
-separately installed and licensed by the WinFsp project.
-
-## What I could not verify
-
-I wrote and reviewed this in a Linux environment with no Windows toolchain, so the
-code has **not been compiled or run**. What I did verify mechanically: the
-rename-normalised diff is exactly the changes in the table above (plus the per-file
-notice comment and two usage-string tweaks), the brace/paren/`#if` structure is
-unchanged apart from the one removed block, no reference to `FileData` survives, and
-your sources are byte-identical to the upstream v2.1 tag. Anything in the *Run*,
-*junction* and *Verify* sections is untested advice from WinFsp's documented
-behaviour, not something I observed.
