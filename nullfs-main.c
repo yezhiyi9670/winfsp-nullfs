@@ -52,6 +52,8 @@ NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
     ULONG FileInfoTimeout = INFINITE;
     ULONG MaxFileNodes = 65536;
     ULONG MaxFileSize = 0;          /* 0: no per-file size limit */
+    ULONG FileMetadataTimeout = 0;  /* -T: expire metadata after N seconds */
+    BOOLEAN Stateless = FALSE;      /* -B: keep no namespace metadata at all */
     ULONG SlowioMaxDelay = 0;       /* -M: maximum slow IO delay in millis */
     ULONG SlowioPercentDelay = 0;   /* -P: percent of slow IO to make pending */
     ULONG SlowioRarefyDelay = 0;    /* -R: adjust the rarity of pending slow IO */
@@ -76,6 +78,9 @@ NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
             break;
         case L'D':
             argtos(DebugLogFile);
+            break;
+        case L'B':
+            Stateless = TRUE;
             break;
         case L'f':
             OtherFlags = NullfsFlushAndPurgeOnCleanup;
@@ -106,6 +111,9 @@ NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
             break;
         case L's':
             argtol(MaxFileSize);
+            break;
+        case L'T':
+            argtol(FileMetadataTimeout);
             break;
         case L't':
             argtol(FileInfoTimeout);
@@ -153,6 +161,8 @@ NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
         FileInfoTimeout,
         MaxFileNodes,
         MaxFileSize,
+        FileMetadataTimeout,
+        Stateless,
         SlowioMaxDelay,
         SlowioPercentDelay,
         SlowioRarefyDelay,
@@ -188,8 +198,9 @@ NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
 
     MountPoint = FspFileSystemMountPoint(NullfsFileSystem(Nullfs));
 
-    info(L"%s -t %ld -n %ld -s %ld%s%s%s%s%s%s",
-        L"" PROGNAME, FileInfoTimeout, MaxFileNodes, MaxFileSize,
+    info(L"%s -t %ld -n %ld -s %ld -T %ld%s%s%s%s%s%s%s",
+        L"" PROGNAME, FileInfoTimeout, MaxFileNodes, MaxFileSize, FileMetadataTimeout,
+        Stateless ? L" -B" : L"",
         RootSddl ? L" -S " : L"", RootSddl ? RootSddl : L"",
         0 != VolumePrefix && L'\0' != VolumePrefix[0] ? L" -u " : L"",
             0 != VolumePrefix && L'\0' != VolumePrefix[0] ? VolumePrefix : L"",
@@ -211,11 +222,13 @@ usage:
         "options:\n"
         "    -d DebugFlags       [-1: enable all debug logs]\n"
         "    -D DebugLogFile     [file path; use - for stderr]\n"
+        "    -B                  [stateless black hole: no metadata at all]\n"
         "    -i                  [case insensitive file system]\n"
         "    -f                  [flush and purge cache on cleanup]\n"
         "    -t FileInfoTimeout  [millis]\n"
-        "    -n MaxFileNodes     [default 65536]\n"
+        "    -n MaxFileNodes     [evict metadata above this; default 65536]\n"
         "    -s MaxFileSize      [bytes; 0 = unlimited (default)]\n"
+        "    -T FileMetadataTimeout [seconds; 0 = never expire (default)]\n"
         "    -M MaxDelay         [maximum slow IO delay in millis]\n"
         "    -P PercentDelay     [percent of slow IO to make pending]\n"
         "    -R RarefyDelay      [adjust the rarity of pending slow IO]\n"

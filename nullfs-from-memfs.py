@@ -3,7 +3,11 @@
 Derive the NullFS sources (nullfs.h / nullfs.cpp / nullfs-main.c) from a pristine
 copy of the WinFsp v2.1 MEMFS sample (memfs.h / memfs.cpp / memfs-main.c).
 
-Usage:  python3 nullfs-from-memfs.py [srcdir] [dstdir]
+Usage:  python3 nullfs-from-memfs.py [srcdir] [dstdir] [--force]
+
+This script produces GENERATION 1 of NullFS only (the memfs -> null file system
+transform). The checked-in sources have since gained metadata eviction/expiry, so
+the script refuses to overwrite them unless --force is given.
 
 The script is deliberately a *textual* transformation: every edit is an exact
 string replacement that must match an expected number of times, so a mismatch
@@ -227,8 +231,18 @@ def edit_nullfs_h(s):
 
 
 def main():
-    srcdir = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
-    dstdir = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else ".")
+    args = [a for a in sys.argv[1:] if a != "--force"]
+    srcdir = pathlib.Path(args[0] if len(args) > 0 else ".")
+    dstdir = pathlib.Path(args[1] if len(args) > 1 else ".")
+
+    if "--force" not in sys.argv:
+        for name in FILES:
+            out = dstdir / name.replace("memfs", "nullfs")
+            if out.exists():
+                raise SystemExit(
+                    "FATAL: %s already exists. This script only regenerates the initial\n"
+                    "NullFS and would discard the metadata-eviction work. Pass --force to\n"
+                    "overwrite it anyway." % out)
 
     for name in FILES:
         text = (srcdir / name).read_text(encoding="utf-8")

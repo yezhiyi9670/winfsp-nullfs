@@ -195,6 +195,16 @@ UINT64 NullfsGetSystemTime(VOID)
 }
 
 static inline
+ULONG NullfsGetSystemTimeSec(VOID)
+{
+    /*
+     * Seconds since 1601, truncated to 32 bits. Only differences are ever used
+     * (unsigned arithmetic stays correct for spans below ~136 years).
+     */
+    return (ULONG)(NullfsGetSystemTime() / 10000000);
+}
+
+static inline
 unsigned NullfsUpperChar(unsigned c)
 {
     /*
@@ -356,6 +366,8 @@ typedef struct _NULLFS_FILE_NODE
     NULLFS_FILE_NODE_EA_MAP *EaMap;
 #endif
     volatile LONG RefCount;
+    UINT64 EvictKey;                /* key in NULLFS_EVICT_MAP; 0 if not queued */
+    volatile LONG LastTouchSec;     /* last create/open, seconds since 1601 */
 #if defined(NULLFS_NAMED_STREAMS)
     struct _NULLFS_FILE_NODE *MainFileNode;
 #endif
@@ -374,12 +386,24 @@ struct NULLFS_FILE_NODE_LESS
 };
 typedef std::map<PWSTR, NULLFS_FILE_NODE *, NULLFS_FILE_NODE_LESS> NULLFS_FILE_NODE_MAP;
 
+/*
+ * NULLFS: file nodes in creation order. Used to retire the oldest metadata once
+ * the node table is full, and by the optional age-based expiry.
+ */
+typedef std::map<UINT64, NULLFS_FILE_NODE *> NULLFS_EVICT_MAP;
+
 typedef struct _NULLFS
 {
     FSP_FILE_SYSTEM *FileSystem;
     NULLFS_FILE_NODE_MAP *FileNodeMap;
-    ULONG MaxFileNodes;
+    NULLFS_EVICT_MAP *EvictMap;
+    UINT64 EvictKeyCounter;
+    ULONG MaxFileNodes;             /* evict metadata once the count would exceed this */
     ULONG MaxFileSize;
+    ULONG FileMetadataTimeout;      /* seconds; 0 = never expire metadata by age */
+    UINT64 NextExpireTime;          /* 100ns units; throttles the expiry sweep */
+    BOOLEAN Stateless;              /* stateless black hole: no namespace metadata */
+    FSP_FILE_SYSTEM_INTERFACE Interface; /* per-instance copy of the interface table */
 #ifdef NULLFS_SLOWIO
     ULONG SlowioMaxDelay;
     ULONG SlowioPercentDelay;
@@ -455,6 +479,14 @@ VOID NullfsFileNodeDereference(NULLFS_FILE_NODE *FileNode)
 {
     if (0 == InterlockedDecrement(&FileNode->RefCount))
         NullfsFileNodeDelete(FileNode);
+}
+
+static inline
+VOID NullfsFileNodeTouch(NULLFS_FILE_NODE *FileNode)
+{
+    /* only a heuristic hint: an approximate value is fine if two calls race */
+    InterlockedExchange((volatile LONG *)&FileNode->LastTouchSec,
+        (LONG)NullfsGetSystemTimeSec());
 }
 
 static inline
@@ -630,6 +662,21 @@ NTSTATUS NullfsFileNodeMapCreate(BOOLEAN CaseInsensitive, NULLFS_FILE_NODE_MAP *
 }
 
 static inline
+NTSTATUS NullfsEvictMapCreate(NULLFS_EVICT_MAP **PEvictMap)
+{
+    *PEvictMap = 0;
+    try
+    {
+        *PEvictMap = new NULLFS_EVICT_MAP();
+        return STATUS_SUCCESS;
+    }
+    catch (...)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+}
+
+static inline
 VOID NullfsFileNodeMapDelete(NULLFS_FILE_NODE_MAP *FileNodeMap)
 {
     for (NULLFS_FILE_NODE_MAP::iterator p = FileNodeMap->begin(), q = FileNodeMap->end(); p != q; ++p)
@@ -710,9 +757,11 @@ VOID NullfsFileNodeMapTouchParent(NULLFS_FILE_NODE_MAP *FileNodeMap, NULLFS_FILE
 }
 
 static inline
-NTSTATUS NullfsFileNodeMapInsert(NULLFS_FILE_NODE_MAP *FileNodeMap, NULLFS_FILE_NODE *FileNode,
+NTSTATUS NullfsFileNodeMapInsert(NULLFS *Nullfs, NULLFS_FILE_NODE *FileNode,
     PBOOLEAN PInserted)
 {
+    NULLFS_FILE_NODE_MAP *FileNodeMap = Nullfs->FileNodeMap;
+
     *PInserted = 0;
     try
     {
@@ -720,6 +769,23 @@ NTSTATUS NullfsFileNodeMapInsert(NULLFS_FILE_NODE_MAP *FileNodeMap, NULLFS_FILE_
         if (*PInserted)
         {
             NullfsFileNodeReference(FileNode);
+            FileNode->LastTouchSec = (LONG)NullfsGetSystemTimeSec();
+            if (0 == FileNode->EvictKey)
+            {
+                /*
+                 * NULLFS: queue the node for eviction. Failing to queue it is
+                 * not fatal; such a node is simply never evicted.
+                 */
+                try
+                {
+                    FileNode->EvictKey = ++Nullfs->EvictKeyCounter;
+                    Nullfs->EvictMap->insert(NULLFS_EVICT_MAP::value_type(FileNode->EvictKey, FileNode));
+                }
+                catch (...)
+                {
+                    FileNode->EvictKey = 0;
+                }
+            }
             NullfsFileNodeMapTouchParent(FileNodeMap, FileNode);
         }
         return STATUS_SUCCESS;
@@ -731,11 +797,16 @@ NTSTATUS NullfsFileNodeMapInsert(NULLFS_FILE_NODE_MAP *FileNodeMap, NULLFS_FILE_
 }
 
 static inline
-VOID NullfsFileNodeMapRemove(NULLFS_FILE_NODE_MAP *FileNodeMap, NULLFS_FILE_NODE *FileNode)
+VOID NullfsFileNodeMapRemove(NULLFS *Nullfs, NULLFS_FILE_NODE *FileNode)
 {
-    if (FileNodeMap->erase(FileNode->FileName))
+    if (Nullfs->FileNodeMap->erase(FileNode->FileName))
     {
-        NullfsFileNodeMapTouchParent(FileNodeMap, FileNode);
+        if (0 != FileNode->EvictKey)
+        {
+            Nullfs->EvictMap->erase(FileNode->EvictKey);
+            FileNode->EvictKey = 0;
+        }
+        NullfsFileNodeMapTouchParent(Nullfs->FileNodeMap, FileNode);
         NullfsFileNodeDereference(FileNode);
     }
 }
@@ -888,6 +959,187 @@ VOID NullfsFileNodeMapEnumerateFree(NULLFS_FILE_NODE_MAP_ENUM_CONTEXT *Context)
         }
     }
     free(Context->FileNodes);
+}
+
+/*
+ * NULLFS: metadata eviction.
+ *
+ * Three tiers, in order of preference:
+ *
+ * 1. the oldest closed regular file (the common case: the oldest backup goes
+ *    first);
+ * 2. the oldest closed *empty* directory;
+ * 3. the oldest closed directory together with its whole subtree (last resort).
+ *
+ * "Closed" means RefCount 1, i.e. only the file node map holds a reference and
+ * no handle is open on the node. A directory that still has children is either
+ * removed together with them (tier 3) or not at all: dropping a directory while
+ * leaving its children behind would silently break every path below it.
+ *
+ * The root directory and the parent directory of the entry currently being
+ * created (Protect) are never evicted.
+ */
+static inline
+BOOLEAN NullfsFileNodeIsRoot(NULLFS_FILE_NODE *FileNode)
+{
+    return L'\\' == FileNode->FileName[0] && L'\0' == FileNode->FileName[1];
+}
+
+static inline
+BOOLEAN NullfsFileNodeIsClosed(NULLFS_FILE_NODE *FileNode)
+{
+    /* RefCount 1: only the file node map holds a reference, no open handles */
+    return 1 == FspInterlockedLoad32((INT32 *)&FileNode->RefCount);
+}
+
+static inline
+BOOLEAN NullfsFileNodeIsDirectory(NULLFS_FILE_NODE *FileNode)
+{
+    return 0 != (FileNode->FileInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static inline
+BOOLEAN NullfsFileNodeIsProtected(NULLFS *Nullfs, NULLFS_FILE_NODE *FileNode,
+    NULLFS_FILE_NODE *Protect)
+{
+    if (0 == Protect)
+        return FALSE;
+
+    if (FileNode == Protect)
+        return TRUE;
+
+    /* is Protect at or below FileNode? */
+    return NullfsFileNameHasPrefix(Protect->FileName, FileNode->FileName,
+        NullfsFileNodeMapIsCaseInsensitive(Nullfs->FileNodeMap));
+}
+
+/*
+ * Evict a directory and everything below it. Returns the number of nodes removed,
+ * or 0 if any node in the subtree is open (in which case nothing is removed).
+ */
+static ULONG NullfsFileNodeMapEvictSubtree(NULLFS *Nullfs, NULLFS_FILE_NODE *DirNode)
+{
+    NULLFS_FILE_NODE_MAP_ENUM_CONTEXT Context = { TRUE };
+    ULONG Index, Count;
+
+    /*
+     * EnumerateDescendants() yields the directory itself plus every entry below
+     * it; with Reference == TRUE each node gains one reference for the duration
+     * of the enumeration.
+     */
+    NullfsFileNodeMapEnumerateDescendants(Nullfs->FileNodeMap, DirNode,
+        NullfsFileNodeMapEnumerateFn, &Context);
+
+    /* the whole subtree must be closed: map reference + enumeration reference == 2 */
+    for (Index = 0; Context.Count > Index; Index++)
+        if (2 != FspInterlockedLoad32((INT32 *)&Context.FileNodes[Index]->RefCount))
+        {
+            NullfsFileNodeMapEnumerateFree(&Context);
+            return 0;
+        }
+
+    Count = Context.Count;
+    for (Index = 0; Context.Count > Index; Index++)
+        NullfsFileNodeMapRemove(Nullfs, Context.FileNodes[Index]);
+
+    NullfsFileNodeMapEnumerateFree(&Context);
+
+    return Count;
+}
+
+static ULONG NullfsFileNodeMapEvict(NULLFS *Nullfs, ULONG Needed, NULLFS_FILE_NODE *Protect)
+{
+    ULONG Evicted = 0;
+    NULLFS_EVICT_MAP::iterator Iter;
+
+    /* tier 1: oldest closed regular file */
+    for (Iter = Nullfs->EvictMap->begin();
+        0 != Needed && Nullfs->EvictMap->end() != Iter; )
+    {
+        NULLFS_FILE_NODE *FileNode = Iter->second;
+        ++Iter; /* removal invalidates only the iterator it erases */
+
+        if (!NullfsFileNodeIsClosed(FileNode) || NullfsFileNodeIsDirectory(FileNode))
+            continue;
+
+        NullfsFileNodeMapRemove(Nullfs, FileNode);
+        --Needed;
+        ++Evicted;
+    }
+
+    /* tier 2: oldest closed empty directory */
+    for (Iter = Nullfs->EvictMap->begin();
+        0 != Needed && Nullfs->EvictMap->end() != Iter; )
+    {
+        NULLFS_FILE_NODE *FileNode = Iter->second;
+        ++Iter;
+
+        if (!NullfsFileNodeIsClosed(FileNode) || !NullfsFileNodeIsDirectory(FileNode) ||
+            NullfsFileNodeIsRoot(FileNode) ||
+            NullfsFileNodeIsProtected(Nullfs, FileNode, Protect) ||
+            NullfsFileNodeMapHasChild(Nullfs->FileNodeMap, FileNode))
+            continue;
+
+        NullfsFileNodeMapRemove(Nullfs, FileNode);
+        --Needed;
+        ++Evicted;
+    }
+
+    /* tier 3: oldest closed directory with its whole subtree (last resort) */
+    while (0 != Needed)
+    {
+        ULONG Freed = 0;
+
+        for (Iter = Nullfs->EvictMap->begin();
+            Nullfs->EvictMap->end() != Iter; ++Iter)
+        {
+            NULLFS_FILE_NODE *FileNode = Iter->second;
+
+            if (!NullfsFileNodeIsClosed(FileNode) || !NullfsFileNodeIsDirectory(FileNode) ||
+                NullfsFileNodeIsRoot(FileNode) ||
+                NullfsFileNodeIsProtected(Nullfs, FileNode, Protect))
+                continue;
+
+            Freed = NullfsFileNodeMapEvictSubtree(Nullfs, FileNode);
+            if (0 != Freed)
+                break; /* subtree removal invalidated the eviction map iterators */
+        }
+
+        if (0 == Freed)
+            break;
+
+        Evicted += Freed;
+        Needed = Freed >= Needed ? 0 : Needed - Freed;
+    }
+
+    return Evicted;
+}
+
+/*
+ * NULLFS: age-based expiry (optional, -T). Only regular files are expired; a
+ * directory is never removed by age, so a quiet tree keeps its shape.
+ */
+static ULONG NullfsFileNodeMapExpire(NULLFS *Nullfs)
+{
+    ULONG Now = NullfsGetSystemTimeSec();
+    ULONG Expired = 0;
+    NULLFS_EVICT_MAP::iterator Iter = Nullfs->EvictMap->begin();
+
+    while (Nullfs->EvictMap->end() != Iter)
+    {
+        NULLFS_FILE_NODE *FileNode = Iter->second;
+        ++Iter;
+
+        if (NullfsFileNodeIsClosed(FileNode) && !NullfsFileNodeIsDirectory(FileNode) &&
+            Now >= (ULONG)FileNode->LastTouchSec &&
+            Now - (ULONG)FileNode->LastTouchSec >= Nullfs->FileMetadataTimeout)
+        {
+            NullfsFileNodeMapRemove(Nullfs, FileNode);
+            ++Expired;
+        }
+    }
+
+    return Expired;
 }
 
 #ifdef NULLFS_SLOWIO
@@ -1113,6 +1365,75 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *FileSystem,
     return STATUS_SUCCESS;
 }
 
+/*
+ * NULLFS stateless mode ("black hole").
+ *
+ * No namespace metadata is kept at all: every Create and every Open succeeds and
+ * hands out a throw-away node that lives only as long as the handle. This works
+ * because WinFsp performs no access check when GetSecurityByName is not
+ * implemented (FspAccessCheckEx returns success immediately in that case), so
+ * the FSD never asks whether a path exists -- it calls Create or Open and
+ * believes whatever it is told.
+ *
+ * The price of having no memory: once a handle is closed its file is forgotten
+ * (reopening it yields an empty file again), directories always enumerate as
+ * empty, and Rename is a no-op.
+ */
+static NTSTATUS NullfsStatelessNode(FSP_FILE_SYSTEM *FileSystem,
+    PWSTR FileName, UINT32 CreateOptions, PSECURITY_DESCRIPTOR SecurityDescriptor,
+    UINT64 AllocationSize, PVOID *PFileNode, FSP_FSCTL_FILE_INFO *FileInfo)
+{
+    NULLFS *Nullfs = (NULLFS *)FileSystem->UserContext;
+    NULLFS_FILE_NODE *FileNode;
+    NULLFS_FILE_NODE *RootNode;
+    NTSTATUS Result;
+
+    if (NULLFS_MAX_PATH <= wcslen(FileName))
+        return STATUS_OBJECT_NAME_INVALID;
+
+    Result = NullfsFileNodeCreate(FileName, &FileNode);
+    if (!NT_SUCCESS(Result))
+        return Result;
+
+    if (CreateOptions & FILE_DIRECTORY_FILE)
+    {
+        FileNode->FileInfo.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+    }
+    else
+    {
+        FileNode->FileInfo.FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+        FileNode->FileInfo.AllocationSize = AllocationSize;
+    }
+
+    /*
+     * Give the throw-away node a security descriptor so that a GetSecurity on
+     * the handle has something plausible to return.
+     */
+    if (0 == SecurityDescriptor)
+    {
+        RootNode = NullfsFileNodeMapGet(Nullfs->FileNodeMap, L"\\");
+        if (0 != RootNode)
+            SecurityDescriptor = (PSECURITY_DESCRIPTOR)RootNode->FileSecurity;
+    }
+    if (0 != SecurityDescriptor)
+    {
+        FileNode->FileSecuritySize = GetSecurityDescriptorLength(SecurityDescriptor);
+        FileNode->FileSecurity = malloc(FileNode->FileSecuritySize);
+        if (0 == FileNode->FileSecurity)
+        {
+            NullfsFileNodeDelete(FileNode);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        memcpy(FileNode->FileSecurity, SecurityDescriptor, FileNode->FileSecuritySize);
+    }
+
+    NullfsFileNodeReference(FileNode);
+    *PFileNode = FileNode;
+    NullfsFileNodeGetFileInfo(FileNode, FileInfo);
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
     PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess,
     UINT32 FileAttributes, PSECURITY_DESCRIPTOR SecurityDescriptor, UINT64 AllocationSize,
@@ -1133,6 +1454,11 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
     if (NULLFS_MAX_PATH <= wcslen(FileName))
         return STATUS_OBJECT_NAME_INVALID;
 
+    /* NULLFS: stateless mode never consults the namespace, and never collides */
+    if (Nullfs->Stateless)
+        return NullfsStatelessNode(FileSystem, FileName, CreateOptions,
+            SecurityDescriptor, AllocationSize, PFileNode, FileInfo);
+
     if (CreateOptions & FILE_DIRECTORY_FILE)
         AllocationSize = 0;
 
@@ -1144,8 +1470,37 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
     if (0 == ParentNode)
         return Result;
 
-    if (NullfsFileNodeMapCount(Nullfs->FileNodeMap) >= Nullfs->MaxFileNodes)
-        return STATUS_CANNOT_MAKE;
+    /*
+     * NULLFS: retire metadata instead of refusing the create.
+     *
+     * Drop metadata untouched for FileMetadataTimeout seconds first (when
+     * enabled), then, if the node table is still full, retire the oldest
+     * metadata: a closed file first, else a closed empty directory, else a
+     * closed directory with its whole subtree. Creation can only fail if every
+     * remaining node is held open by a handle.
+     */
+    if (0 != Nullfs->FileMetadataTimeout && NullfsGetSystemTime() >= Nullfs->NextExpireTime)
+    {
+        ULONG Interval = Nullfs->FileMetadataTimeout / 4;
+        if (1 > Interval)
+            Interval = 1;
+        else if (60 < Interval)
+            Interval = 60;
+        Nullfs->NextExpireTime = NullfsGetSystemTime() + (UINT64)Interval * 10000000;
+
+        NullfsFileNodeMapExpire(Nullfs);
+    }
+
+    if (0 != Nullfs->MaxFileNodes &&
+        NullfsFileNodeMapCount(Nullfs->FileNodeMap) >= Nullfs->MaxFileNodes)
+    {
+        NullfsFileNodeMapEvict(Nullfs,
+            (ULONG)(NullfsFileNodeMapCount(Nullfs->FileNodeMap) - Nullfs->MaxFileNodes) + 1,
+            ParentNode);
+
+        if (NullfsFileNodeMapCount(Nullfs->FileNodeMap) >= Nullfs->MaxFileNodes)
+            return STATUS_CANNOT_MAKE;
+    }
 
     if (0 != Nullfs->MaxFileSize && AllocationSize > Nullfs->MaxFileSize)
         return STATUS_DISK_FULL;
@@ -1244,7 +1599,7 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
      */
     FileNode->FileInfo.AllocationSize = AllocationSize;
 
-    Result = NullfsFileNodeMapInsert(Nullfs->FileNodeMap, FileNode, &Inserted);
+    Result = NullfsFileNodeMapInsert(Nullfs, FileNode, &Inserted);
     if (!NT_SUCCESS(Result) || !Inserted)
     {
         NullfsFileNodeDelete(FileNode);
@@ -1285,6 +1640,11 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
     FileNode = NullfsFileNodeMapGet(Nullfs->FileNodeMap, FileName);
     if (0 == FileNode)
     {
+        /* NULLFS: in stateless mode any path opens as a fresh, empty file */
+        if (Nullfs->Stateless)
+            return NullfsStatelessNode(FileSystem, FileName, CreateOptions,
+                0, 0, PFileNode, FileInfo);
+
         Result = STATUS_OBJECT_NAME_NOT_FOUND;
         NullfsFileNodeMapGetParent(Nullfs->FileNodeMap, FileName, &Result);
         return Result;
@@ -1306,6 +1666,7 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
     }
 #endif
 
+    NullfsFileNodeTouch(FileNode);
     NullfsFileNodeReference(FileNode);
     *PFileNode = FileNode;
     NullfsFileNodeGetFileInfo(FileNode, FileInfo);
@@ -1345,7 +1706,7 @@ static NTSTATUS Overwrite(FSP_FILE_SYSTEM *FileSystem,
     {
         LONG RefCount = FspInterlockedLoad32((INT32 *)&Context.FileNodes[Index]->RefCount);
         if (2 >= RefCount)
-            NullfsFileNodeMapRemove(Nullfs->FileNodeMap, Context.FileNodes[Index]);
+            NullfsFileNodeMapRemove(Nullfs, Context.FileNodes[Index]);
     }
     NullfsFileNodeMapEnumerateFree(&Context);
 #endif
@@ -1429,11 +1790,13 @@ static VOID Cleanup(FSP_FILE_SYSTEM *FileSystem,
         NullfsFileNodeMapEnumerateNamedStreams(Nullfs->FileNodeMap, FileNode,
             NullfsFileNodeMapEnumerateFn, &Context);
         for (Index = 0; Context.Count > Index; Index++)
-            NullfsFileNodeMapRemove(Nullfs->FileNodeMap, Context.FileNodes[Index]);
+            NullfsFileNodeMapRemove(Nullfs, Context.FileNodes[Index]);
         NullfsFileNodeMapEnumerateFree(&Context);
 #endif
 
-        NullfsFileNodeMapRemove(Nullfs->FileNodeMap, FileNode);
+        /* NULLFS: in stateless mode the node was never in the namespace */
+        if (!Nullfs->Stateless)
+            NullfsFileNodeMapRemove(Nullfs, FileNode);
     }
 }
 
@@ -1716,6 +2079,10 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem,
     BOOLEAN Inserted;
     NTSTATUS Result;
 
+    /* NULLFS: in stateless mode there is no namespace to rename */
+    if (Nullfs->Stateless)
+        return STATUS_SUCCESS;
+
     NewFileNode = NullfsFileNodeMapGet(Nullfs->FileNodeMap, NewFileName);
     if (0 != NewFileNode && FileNode != NewFileNode)
     {
@@ -1750,19 +2117,19 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem,
     if (0 != NewFileNode)
     {
         NullfsFileNodeReference(NewFileNode);
-        NullfsFileNodeMapRemove(Nullfs->FileNodeMap, NewFileNode);
+        NullfsFileNodeMapRemove(Nullfs, NewFileNode);
         NullfsFileNodeDereference(NewFileNode);
     }
 
     for (Index = 0; Context.Count > Index; Index++)
     {
         DescendantFileNode = Context.FileNodes[Index];
-        NullfsFileNodeMapRemove(Nullfs->FileNodeMap, DescendantFileNode);
+        NullfsFileNodeMapRemove(Nullfs, DescendantFileNode);
         memmove(DescendantFileNode->FileName + NewFileNameLen,
             DescendantFileNode->FileName + FileNameLen,
             (wcslen(DescendantFileNode->FileName) + 1 - FileNameLen) * sizeof(WCHAR));
         memcpy(DescendantFileNode->FileName, NewFileName, NewFileNameLen * sizeof(WCHAR));
-        Result = NullfsFileNodeMapInsert(Nullfs->FileNodeMap, DescendantFileNode, &Inserted);
+        Result = NullfsFileNodeMapInsert(Nullfs, DescendantFileNode, &Inserted);
         if (!NT_SUCCESS(Result))
         {
             FspDebugLog(__FUNCTION__ ": cannot insert into FileNodeMap; aborting\n");
@@ -1895,6 +2262,13 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *FileSystem,
     Context.Buffer = Buffer;
     Context.Length = Length;
     Context.PBytesTransferred = PBytesTransferred;
+
+    /* NULLFS: in stateless mode every directory enumerates as empty */
+    if (Nullfs->Stateless)
+    {
+        FspFileSystemAddDirInfo(0, Buffer, Length, PBytesTransferred);
+        return STATUS_SUCCESS;
+    }
 
     if (L'\0' != FileNode->FileName[1])
     {
@@ -2365,6 +2739,8 @@ NTSTATUS NullfsCreateFunnel(
     ULONG FileInfoTimeout,
     ULONG MaxFileNodes,
     ULONG MaxFileSize,
+    ULONG FileMetadataTimeout,
+    BOOLEAN Stateless,
     ULONG SlowioMaxDelay,
     ULONG SlowioPercentDelay,
     ULONG SlowioRarefyDelay,
@@ -2410,6 +2786,8 @@ NTSTATUS NullfsCreateFunnel(
     Nullfs->MaxFileNodes = MaxFileNodes;
     AllocationUnit = NULLFS_SECTOR_SIZE * NULLFS_SECTORS_PER_ALLOCATION_UNIT;
     Nullfs->MaxFileSize = (ULONG)((MaxFileSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit);
+    Nullfs->FileMetadataTimeout = FileMetadataTimeout;
+    Nullfs->Stateless = Stateless;
 
 #ifdef NULLFS_SLOWIO
     Nullfs->SlowioMaxDelay = SlowioMaxDelay;
@@ -2425,6 +2803,15 @@ NTSTATUS NullfsCreateFunnel(
         return Result;
     }
 
+    Result = NullfsEvictMapCreate(&Nullfs->EvictMap);
+    if (!NT_SUCCESS(Result))
+    {
+        NullfsFileNodeMapDelete(Nullfs->FileNodeMap);
+        free(Nullfs);
+        LocalFree(RootSecurity);
+        return Result;
+    }
+
     memset(&VolumeParams, 0, sizeof VolumeParams);
     VolumeParams.Version = sizeof FSP_FSCTL_VOLUME_PARAMS;
     VolumeParams.SectorSize = NULLFS_SECTOR_SIZE;
@@ -2435,7 +2822,7 @@ NTSTATUS NullfsCreateFunnel(
     VolumeParams.CaseSensitiveSearch = !CaseInsensitive;
     VolumeParams.CasePreservedNames = 1;
     VolumeParams.UnicodeOnDisk = 1;
-    VolumeParams.PersistentAcls = 1;
+    VolumeParams.PersistentAcls = !Stateless;
     VolumeParams.ReparsePoints = 1;
     VolumeParams.ReparsePointsAccessCheck = 0;
 #if defined(NULLFS_NAMED_STREAMS)
@@ -2466,9 +2853,20 @@ NTSTATUS NullfsCreateFunnel(
     wcscpy_s(VolumeParams.FileSystemName, sizeof VolumeParams.FileSystemName / sizeof(WCHAR),
         0 != FileSystemName ? FileSystemName : L"-NULLFS");
 
-    Result = FspFileSystemCreate(DevicePath, &VolumeParams, &NullfsInterface, &Nullfs->FileSystem);
+    /*
+     * NULLFS: give each instance its own copy of the interface table. In
+     * stateless mode GetSecurityByName is cleared, which makes the FSD skip all
+     * access checks (FspAccessCheckEx short-circuits on a missing handler) and
+     * therefore never require a path -- or its parent -- to exist.
+     */
+    Nullfs->Interface = NullfsInterface;
+    if (Stateless)
+        Nullfs->Interface.GetSecurityByName = 0;
+
+    Result = FspFileSystemCreate(DevicePath, &VolumeParams, &Nullfs->Interface, &Nullfs->FileSystem);
     if (!NT_SUCCESS(Result))
     {
+        delete Nullfs->EvictMap;
         NullfsFileNodeMapDelete(Nullfs->FileNodeMap);
         free(Nullfs);
         LocalFree(RootSecurity);
@@ -2509,7 +2907,7 @@ NTSTATUS NullfsCreateFunnel(
     RootNode->FileSecuritySize = RootSecuritySize;
     memcpy(RootNode->FileSecurity, RootSecurity, RootSecuritySize);
 
-    Result = NullfsFileNodeMapInsert(Nullfs->FileNodeMap, RootNode, &Inserted);
+    Result = NullfsFileNodeMapInsert(Nullfs, RootNode, &Inserted);
     if (!NT_SUCCESS(Result))
     {
         NullfsFileNodeDelete(RootNode);
@@ -2529,6 +2927,7 @@ VOID NullfsDelete(NULLFS *Nullfs)
 {
     FspFileSystemDelete(Nullfs->FileSystem);
 
+    delete Nullfs->EvictMap;
     NullfsFileNodeMapDelete(Nullfs->FileNodeMap);
 
     free(Nullfs);

@@ -45,12 +45,14 @@ enum
     NullfsNoSlowio                       = 0x10000000,
 };
 
-#define NullfsCreate(Flags, FileInfoTimeout, MaxFileNodes, MaxFileSize, VolumePrefix, RootSddl, PNullfs)\
+#define NullfsCreate(Flags, FileInfoTimeout, MaxFileNodes, MaxFileSize, FileMetadataTimeout, Stateless, VolumePrefix, RootSddl, PNullfs)\
     NullfsCreateFunnel(\
         Flags,\
         FileInfoTimeout,\
         MaxFileNodes,\
         MaxFileSize,\
+        FileMetadataTimeout,\
+        Stateless,\
         0/*SlowioMaxDelay*/,\
         0/*SlowioPercentDelay*/,\
         0/*SlowioRarefyDelay*/,\
@@ -63,6 +65,8 @@ NTSTATUS NullfsCreateFunnel(
     ULONG FileInfoTimeout,
     ULONG MaxFileNodes,
     ULONG MaxFileSize,
+    ULONG FileMetadataTimeout,
+    BOOLEAN Stateless,
     ULONG SlowioMaxDelay,
     ULONG SlowioPercentDelay,
     ULONG SlowioRarefyDelay,
