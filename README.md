@@ -1,5 +1,11 @@
 # NullFS
 
+> [!WARNING]
+>
+> This is created with LLM assistance and is considered experimental. Do not use for mission-critical production purposes.
+>
+> Files written into the NullFS filesystem is **EXPECTED to be corrupt and to later vanish** without any warning. That's what "Null" means (data is discarded and stored nowhere) and what "NullFS" is expected to do.
+
 A "null" file system for Windows, built on [WinFsp](https://github.com/winfsp/winfsp).
 
 It presents a normal drive (`X:`) with a real, writable directory tree, but **no file
